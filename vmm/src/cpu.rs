@@ -11,13 +11,17 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{__cpuid_count, _rdtsc};
+#[cfg(target_arch = "x86_64")]
+use core::arch::asm;
 use std::collections::BTreeMap;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::io::Write;
 use std::mem::zeroed;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::{any, cmp, hint, io, panic, result, thread, time};
 
 #[cfg(target_arch = "aarch64")]
@@ -825,6 +829,48 @@ impl TryFrom<i32> for CoreSchedulingLeader {
     }
 }
 
+#[inline(always)]
+fn wait_short_no_sleep(spin_idx: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_WAITPKG: OnceLock<bool> = OnceLock::new();
+        let has_waitpkg = *HAS_WAITPKG.get_or_init(|| {
+            // SAFETY: CPUID leaf 7 subleaf 0 is always safe on x86_64.
+            let cpuid = unsafe { __cpuid_count(7, 0) };
+            (cpuid.ecx & (1 << 5)) != 0
+        });
+        if has_waitpkg {
+            // SAFETY: TPAUSE (WAITPKG) only pauses the current hardware thread briefly.
+            unsafe {
+                let target = _rdtsc().wrapping_add(300);
+                let lo = (target & 0xffff_ffff) as u32;
+                let hi = (target >> 32) as u32;
+                asm!(
+                    ".byte 0x66, 0x0f, 0xae, 0xf1",
+                    in("ecx") 0u32,
+                    in("eax") lo,
+                    in("edx") hi,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+        } else {
+            for _ in 0..16 {
+                hint::spin_loop();
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        hint::spin_loop();
+    }
+    if spin_idx >= 2 {
+        // SAFETY: sched_yield is a standard POSIX syscall with no memory safety preconditions.
+        unsafe {
+            libc::sched_yield();
+        }
+    }
+}
+
 /// Management structure for a vCPU (thread).
 #[derive(Default)]
 struct VcpuState {
@@ -839,6 +885,8 @@ struct VcpuState {
     vcpu_run_interrupted: Arc<AtomicBool>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
     paused: Arc<AtomicBool>,
+    /// Waiter thread to unpark when vCPU acknowledges pause/signal.
+    pause_waiter: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 impl VcpuState {
@@ -872,19 +920,30 @@ impl VcpuState {
     /// This is the counterpart of [`Self::signal_thread`].
     fn wait_until_signal_acknowledged(&self) -> Result<()> {
         if let Some(_handle) = self.handle.as_ref() {
-            let mut count = 0;
-            loop {
+            for _ in 0..32 {
                 if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                // This is more effective than thread::yield_now() at
-                // avoiding a priority inversion with the vCPU thread
-                thread::sleep(time::Duration::from_millis(1));
+                hint::spin_loop();
+            }
+            let mut count: u32 = 0;
+            loop {
+                *self.pause_waiter.lock().unwrap() = Some(thread::current());
+                if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
+                    *self.pause_waiter.lock().unwrap() = None;
+                    return Ok(());
+                }
+                thread::park_timeout(time::Duration::from_micros(200));
+                if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
+                    *self.pause_waiter.lock().unwrap() = None;
+                    return Ok(());
+                }
                 count += 1;
-                if count >= 1000 {
+                if count >= 5_000 {
+                    *self.pause_waiter.lock().unwrap() = None;
                     return Err(Error::SignalAcknowledgeTimeout);
-                } else if count % 10 == 0 {
-                    warn!("vCPU thread did not respond in {count}ms to signal - retrying");
+                } else if count.is_multiple_of(50) {
+                    warn!("vCPU thread did not respond to signal - retrying");
                     self.signal_thread();
                 }
             }
@@ -1257,6 +1316,8 @@ impl CpuManager {
             Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].vcpu_run_interrupted);
         let panic_vcpu_run_interrupted = Arc::clone(&vcpu_run_interrupted);
         let vcpu_paused = Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].paused);
+        let vcpu_pause_waiter =
+            Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].pause_waiter);
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1283,6 +1344,12 @@ impl CpuManager {
             thread::Builder::new()
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
+                    // Reset vCPU thread priority to nice 0 so control threads (vmm/http-server at nice -20)
+                    // immediately preempt running vCPU threads during Live Update.
+                    // SAFETY: setpriority on the current thread (who = 0) is always safe.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 0);
+                    }
                     // Schedule the thread to run on the expected CPU set
                     if let Some(cpuset) = cpuset.as_ref() {
                         let cpuset: *const libc::cpu_set_t = cpuset;
@@ -1382,6 +1449,7 @@ impl CpuManager {
                     vcpu_thread_barrier.wait();
 
                     panic::catch_unwind(move || {
+                        let mut has_entered_vm_run = false;
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1412,7 +1480,9 @@ impl CpuManager {
                                 // to be executed.
 
                                 #[cfg(feature = "kvm")]
-                                if matches!(hypervisor_type, HypervisorType::Kvm) {
+                                if has_entered_vm_run
+                                    && matches!(hypervisor_type, HypervisorType::Kvm)
+                                {
                                     vcpu.lock().unwrap().vcpu.set_immediate_exit(true);
                                     if !matches!(vcpu.lock().unwrap().run(), Ok(VmExit::Ignore)) {
                                         error!("Unexpected VM exit on \"immediate_exit\" run");
@@ -1421,9 +1491,11 @@ impl CpuManager {
                                     vcpu.lock().unwrap().vcpu.set_immediate_exit(false);
                                 }
 
-                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
-
                                 vcpu_paused.store(true, Ordering::SeqCst);
+                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                if let Some(waiter) = vcpu_pause_waiter.lock().unwrap().take() {
+                                    waiter.unpark();
+                                }
                                 while vcpus_pause_signalled.load(Ordering::SeqCst) {
                                     thread::park();
                                 }
@@ -1433,6 +1505,9 @@ impl CpuManager {
 
                             if vcpus_kick_signalled.load(Ordering::SeqCst) {
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                if let Some(waiter) = vcpu_pause_waiter.lock().unwrap().take() {
+                                    waiter.unpark();
+                                }
                                 #[cfg(target_arch = "x86_64")]
                                 match vcpu.lock().as_ref().unwrap().vcpu.nmi() {
                                     Ok(()) => {},
@@ -1448,12 +1523,17 @@ impl CpuManager {
                                 || vcpu_kill.load(Ordering::SeqCst)
                             {
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                if let Some(waiter) = vcpu_pause_waiter.lock().unwrap().take() {
+                                    waiter.unpark();
+                                }
                                 break;
                             }
 
                             let mut vcpu = vcpu.lock().unwrap();
                             // vcpu.run() returns false on a triple-fault so trigger a reset
-                            match vcpu.run() {
+                            let run_res = vcpu.run();
+                            has_entered_vm_run = true;
+                            match run_res {
                                 Ok(run) => match run {
                                     #[cfg(feature = "kvm")]
                                     VmExit::Debug => {
@@ -2811,9 +2891,10 @@ impl Pausable for CpuManager {
         for state in self.vcpu_states.lock().unwrap().iter() {
             if state.active() {
                 // wait for vCPU to update state
+                let mut spins = 0u32;
                 while !state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(time::Duration::from_millis(1));
+                    wait_short_no_sleep(spins);
+                    spins = spins.saturating_add(1);
                 }
             }
         }
@@ -2822,11 +2903,11 @@ impl Pausable for CpuManager {
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
+        let vcpu_states = self.vcpu_states.lock().unwrap();
+
         // Ensure that vCPUs keep running after being unpark() in
         // their run vCPU loop.
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
-
-        let vcpu_states = self.vcpu_states.lock().unwrap();
 
         // Unpark all the vCPU threads.
         // Step 1/2: signal each thread
@@ -2839,9 +2920,10 @@ impl Pausable for CpuManager {
         {
             for state in vcpu_states.iter() {
                 // wait for vCPU to update state
+                let mut spins = 0u32;
                 while state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(time::Duration::from_millis(1));
+                    wait_short_no_sleep(spins);
+                    spins = spins.saturating_add(1);
                 }
             }
         }

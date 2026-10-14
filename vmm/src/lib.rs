@@ -483,6 +483,11 @@ pub fn start_vmm_thread(
     no_shutdown: bool,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
+    // SAFETY: setpriority on the current process (who = 0) is always safe.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, -20);
+    }
+
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
     #[cfg(feature = "guest_debug")]

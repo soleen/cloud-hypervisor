@@ -841,6 +841,7 @@ fn vmm_thread_rules(
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_setpriority, vec![]),
         (libc::SYS_setsid, vec![]),
         (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
