@@ -2086,7 +2086,7 @@ impl MemoryManager {
                 guest_memory,
                 boot_guest_memory,
                 data.hotplug_slots.clone(),
-                data.next_memory_slot,
+                0,
                 data.selected_slot,
                 data.next_hotplug_slot,
             )
