@@ -26,7 +26,7 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::sync::Mutex;
-#[cfg(feature = "sev_snp")]
+#[cfg(any(feature = "sev_snp", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1958,6 +1958,9 @@ pub struct KvmVcpu {
     memory_conversion_handler: Arc<OnceLock<Arc<dyn vm::MemoryConversionHandler>>>,
 }
 
+#[cfg(target_arch = "x86_64")]
+static VALID_MSR_ENTRIES: OnceLock<(usize, Vec<MsrEntry>)> = OnceLock::new();
+
 #[cfg(feature = "sev_snp")]
 impl KvmVcpu {
     fn validate_gpa_range(&self, gpa: u64, num_pages: u64) -> cpu::Result<u64> {
@@ -3213,11 +3216,17 @@ impl cpu::Vcpu for KvmVcpu {
         // expected amount, we fallback onto a slower method by getting MSRs
         // by chunks. This is the only way to make sure we try to get as many
         // MSRs as possible, even if some MSRs are not supported.
-        let mut msr_entries = self.msrs.clone();
-
         // Save extra MSRs if the Hyper-V synthetic interrupt controller is
         // emulated.
         let hyperv_synic = self.hyperv_synic.load(Ordering::Acquire);
+        let mut msr_entries = if !hyperv_synic
+            && let Some((orig_len, valid)) = VALID_MSR_ENTRIES.get()
+            && *orig_len == self.msrs.len()
+        {
+            valid.clone()
+        } else {
+            self.msrs.clone()
+        };
         if hyperv_synic {
             let hyperv_synic_msrs = vec![
                 0x40000020, 0x40000021, 0x40000080, 0x40000081, 0x40000082, 0x40000083, 0x40000084,
@@ -3238,6 +3247,16 @@ impl cpu::Vcpu for KvmVcpu {
         let expected_num_msrs = msr_entries.len();
         let num_msrs = self.get_msrs(&mut msr_entries)?;
         let msrs = if num_msrs == expected_num_msrs {
+            if !hyperv_synic && VALID_MSR_ENTRIES.get().is_none() {
+                let template: Vec<MsrEntry> = msr_entries
+                    .iter()
+                    .map(|e| MsrEntry {
+                        index: e.index,
+                        data: 0,
+                    })
+                    .collect();
+                let _ = VALID_MSR_ENTRIES.set((self.msrs.len(), template));
+            }
             msr_entries
         } else {
             let mut faulty_msr_index = num_msrs;
@@ -3262,6 +3281,17 @@ impl cpu::Vcpu for KvmVcpu {
                 }
 
                 faulty_msr_index = start_pos + num_msrs;
+            }
+
+            if !hyperv_synic && VALID_MSR_ENTRIES.get().is_none() {
+                let template: Vec<MsrEntry> = msr_entries_tmp
+                    .iter()
+                    .map(|e| MsrEntry {
+                        index: e.index,
+                        data: 0,
+                    })
+                    .collect();
+                let _ = VALID_MSR_ENTRIES.set((self.msrs.len(), template));
             }
 
             msr_entries_tmp
@@ -3501,7 +3531,22 @@ impl cpu::Vcpu for KvmVcpu {
         // MSRs as possible, even if some MSRs are not supported.
         let expected_num_msrs = state.msrs.len();
         let num_msrs = self.set_msrs(&state.msrs)?;
-        if num_msrs != expected_num_msrs {
+        if num_msrs == expected_num_msrs {
+            if !state.hyperv_synic
+                && state.msrs.len() * 2 >= self.msrs.len()
+                && VALID_MSR_ENTRIES.get().is_none()
+            {
+                let template: Vec<MsrEntry> = state
+                    .msrs
+                    .iter()
+                    .map(|e| MsrEntry {
+                        index: e.index,
+                        data: 0,
+                    })
+                    .collect();
+                let _ = VALID_MSR_ENTRIES.set((self.msrs.len(), template));
+            }
+        } else {
             let mut faulty_msr_index = num_msrs;
             let mut required_feature_msr_not_set = false;
             loop {

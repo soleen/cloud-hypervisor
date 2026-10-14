@@ -131,7 +131,7 @@ pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
 // On large servers, the thread overhead outgrows the benefit, especially on
 // loaded hosts. These values are a sweet spot on developer laptops and servers.
 const VCPU_SERIALIZE_MAX_THREADS: usize = 32;
-const VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD: usize = 4;
+const VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD: usize = 1;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1742,6 +1742,22 @@ impl CpuManager {
 
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
     pub fn start_boot_vcpus(&mut self, paused: bool) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if self.dynamic
+            && {
+                #[cfg(feature = "sev_snp")]
+                {
+                    !self.sev_snp_enabled
+                }
+                #[cfg(not(feature = "sev_snp"))]
+                {
+                    true
+                }
+            }
+            && let Some(vcpu0) = self.vcpus.first()
+        {
+            let _ = vcpu0.lock().unwrap().vcpu.state();
+        }
         self.activate_vcpus(self.boot_vcpus(), false, Some(paused))
     }
 
@@ -3029,7 +3045,7 @@ impl Snapshottable for CpuManager {
                 Ok((vcpu.id(), vcpu.snapshot()?))
             },
             VCPU_SERIALIZE_MAX_THREADS,
-            VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD,
+            1,
         )?;
 
         // The CpuManager snapshot is a collection of all vCPUs snapshots.
