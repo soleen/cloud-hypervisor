@@ -100,10 +100,8 @@ use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayl
 #[cfg(feature = "igvm")]
 use crate::igvm::{igvm_loader, parse_igvm};
 use crate::landlock::LandlockError;
-#[cfg(feature = "tdx")]
-use crate::memory_manager;
 use crate::memory_manager::{
-    Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData, MemoryRangePolicy,
+    self, Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData, MemoryRangePolicy,
 };
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
@@ -1473,6 +1471,10 @@ impl Vm {
         hypervisor: &dyn hypervisor::Hypervisor,
         config: HypervisorVmConfig,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
+        if let Some(vm) = memory_manager::take_prewarmed_kvm_vm() {
+            return Ok(vm);
+        }
+
         hypervisor.check_required_extensions().unwrap();
 
         let vm = hypervisor.create_vm(config).unwrap();

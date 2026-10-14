@@ -487,6 +487,7 @@ pub fn start_vmm_thread(
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, -20);
     }
+    memory_manager::prewarm_devmem_from_env(&hypervisor);
 
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
@@ -2030,30 +2031,40 @@ impl Vmm {
         let dest_cpuid = &{
             let vm_config = &src_vm_config.lock().unwrap();
 
-            if vm_config.cpus.features.amx {
-                // Need to enable AMX tile state components before generating common cpuid
-                // as this affects what Hypervisor::get_supported_cpuid returns.
-                self.hypervisor
-                    .enable_amx_state_components()
-                    .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+            if !vm_config.cpus.kvm_hyperv
+                && !vm_config.cpus.features.amx
+                && vm_config.cpus.profile == arch::CpuProfile::default()
+                && vm_config.cpus.max_phys_bits == vm_config::DEFAULT_MAX_PHYS_BITS
+            {
+                cpu::get_cached_default_cpuid(self.hypervisor.as_ref())
+                    .context("Error generating common cpuid")
+                    .map_err(MigratableError::MigrateReceive)?
+            } else {
+                if vm_config.cpus.features.amx {
+                    // Need to enable AMX tile state components before generating common cpuid
+                    // as this affects what Hypervisor::get_supported_cpuid returns.
+                    self.hypervisor
+                        .enable_amx_state_components()
+                        .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+                }
+
+                let phys_bits =
+                    vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
+
+                arch::generate_common_cpuid(
+                    self.hypervisor.as_ref(),
+                    &arch::CpuidConfig {
+                        phys_bits,
+                        kvm_hyperv: vm_config.cpus.kvm_hyperv,
+                        #[cfg(feature = "tdx")]
+                        tdx: false,
+                        amx: vm_config.cpus.features.amx,
+                        profile: vm_config.cpus.profile,
+                    },
+                )
+                .context("Error generating common cpuid")
+                .map_err(MigratableError::MigrateReceive)?
             }
-
-            let phys_bits =
-                vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
-
-            arch::generate_common_cpuid(
-                self.hypervisor.as_ref(),
-                &arch::CpuidConfig {
-                    phys_bits,
-                    kvm_hyperv: vm_config.cpus.kvm_hyperv,
-                    #[cfg(feature = "tdx")]
-                    tdx: false,
-                    amx: vm_config.cpus.features.amx,
-                    profile: vm_config.cpus.profile,
-                },
-            )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateReceive)?
         };
         arch::CpuidFeatureEntry::check_cpuid_compatibility(src_vm_cpuid, dest_cpuid)
             .context("Error checking cpu feature compatibility")

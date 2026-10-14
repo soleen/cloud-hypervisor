@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
-use std::{cmp, ffi, panic, process, result, thread, time};
+use std::{cmp, env, ffi, hint, panic, process, ptr, result, thread, time};
 
 use acpi_tables::{Aml, aml};
 use anyhow::{Context, anyhow};
@@ -56,6 +56,10 @@ use crate::config::MemoryRestoreMode;
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::cpu::{
+    get_cached_default_cpuid, get_cached_default_msr_updates, prewarm_cpuid_and_msrs,
+};
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::pagemap::PageMap;
@@ -63,6 +67,7 @@ use crate::sparse::{clone_file_range, next_data_extent, write_region_sparse};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
+use crate::vm::Vm;
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, userfaultfd};
 
@@ -75,6 +80,327 @@ struct UffdHandler {
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
+
+type PremappedDevmemEntry = (PathBuf, u64, usize, MmapRegion<AtomicBitmap>);
+
+static PREMAPPED_DEVMEM: Mutex<Vec<PremappedDevmemEntry>> = Mutex::new(Vec::new());
+static PREWARMED_KVM_VM: Mutex<Option<Arc<dyn hypervisor::Vm>>> = Mutex::new(None);
+static PREMAPPED_KVM_SLOTS: Mutex<Vec<(u32, u64, usize, usize)>> = Mutex::new(Vec::new());
+static PREWARMED_KVM_VCPUS: Mutex<Vec<(u32, Box<dyn hypervisor::Vcpu>)>> = Mutex::new(Vec::new());
+
+pub fn take_prewarmed_kvm_vm() -> Option<Arc<dyn hypervisor::Vm>> {
+    PREWARMED_KVM_VM.lock().unwrap().take()
+}
+
+pub fn take_prewarmed_kvm_vcpu(apic_id: u32) -> Option<Box<dyn hypervisor::Vcpu>> {
+    let mut guard = PREWARMED_KVM_VCPUS.lock().unwrap();
+    if let Some(idx) = guard.iter().position(|(id, _)| *id == apic_id) {
+        Some(guard.swap_remove(idx).1)
+    } else {
+        None
+    }
+}
+
+fn prewarm_kvm_vm_and_vcpus(
+    hypervisor: &Arc<dyn hypervisor::Hypervisor>,
+    regions_out: &[PremappedDevmemEntry],
+) {
+    #[cfg(target_arch = "x86_64")]
+    prewarm_cpuid_and_msrs(hypervisor.as_ref());
+
+    let Ok(vm) = Vm::create_hypervisor_vm(
+        hypervisor.as_ref(),
+        hypervisor::HypervisorVmConfig::default(),
+    ) else {
+        return;
+    };
+
+    const LOW_RAM_MAX_U64: u64 = 3 << 30;
+    let mut slots_out = Vec::new();
+    for (idx, (_, file_off, reg_size, region)) in regions_out.iter().enumerate() {
+        let slot = idx as u32;
+        let gpa = if idx == 0 {
+            0
+        } else {
+            layout::RAM_64BIT_START.raw_value() + (*file_off - regions_out[0].1 - LOW_RAM_MAX_U64)
+        };
+        let ptr = region.as_ptr();
+        // SAFETY: `region` is a valid, live MmapRegion of length `*reg_size`.
+        let res = unsafe {
+            vm.create_user_memory_region(
+                slot,
+                gpa,
+                *reg_size,
+                ptr,
+                false,
+                false,
+                hypervisor::MemoryVisibility::Private,
+            )
+        };
+        if res.is_err() {
+            return;
+        }
+        // SAFETY: `ptr` and `*reg_size` describe the valid `region` mapping.
+        let _ = unsafe {
+            libc::madvise(
+                ptr.cast(),
+                *reg_size as libc::size_t,
+                libc::MADV_DONTDUMP,
+            )
+        };
+        slots_out.push((slot, gpa, *reg_size, ptr as usize));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let msr_update = get_cached_default_msr_updates(hypervisor.as_ref());
+
+    let num_vcpus: u32 = env::var("OVM_PREWARM_VCPUS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(16);
+    let mut vcpus_out = Vec::with_capacity(num_vcpus as usize);
+    for apic_id in 0..num_vcpus {
+        let Ok(vcpu) = vm.create_vcpu(
+            apic_id,
+            None,
+            #[cfg(target_arch = "x86_64")]
+            msr_update.clone(),
+        ) else {
+            return;
+        };
+        vcpus_out.push((apic_id, vcpu));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some((_, first_vcpu)) = vcpus_out.first() {
+        if let Ok(cpuid) = get_cached_default_cpuid(hypervisor.as_ref()) {
+            let _ = first_vcpu.set_cpuid2(&cpuid);
+        }
+        let _ = first_vcpu.state();
+    }
+
+    *PREMAPPED_KVM_SLOTS.lock().unwrap() = slots_out;
+    *PREWARMED_KVM_VCPUS.lock().unwrap() = vcpus_out;
+    *PREWARMED_KVM_VM.lock().unwrap() = Some(vm);
+}
+
+fn prefault_and_dontdump(base: *mut u8, size: usize, is_devmem: bool) {
+    if !is_devmem {
+        // SAFETY: `base` and `size` come from a newly built MmapRegion.
+        unsafe {
+            let _ = libc::madvise(base.cast(), size as libc::size_t, libc::MADV_HUGEPAGE);
+            // MADV_POPULATE_WRITE = 23 on Linux
+            if libc::madvise(base.cast(), size as libc::size_t, 23) != 0 {
+                let mut acc: u8 = 0;
+                let mut off: usize = 0;
+                while off < size {
+                    acc ^= ptr::read_volatile(base.add(off));
+                    off += 2 * 1024 * 1024;
+                }
+                hint::black_box(acc);
+            }
+            let _ = libc::madvise(base.cast(), size as libc::size_t, libc::MADV_DONTDUMP);
+        }
+    }
+}
+
+pub fn prewarm_devmem_from_env(hypervisor: &Arc<dyn hypervisor::Hypervisor>) {
+    let Ok(val) = env::var("OVM_PREMAP_DEVMEM") else {
+        return;
+    };
+    let parse_u64 = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            s.parse::<u64>().ok()
+        }
+    };
+
+    const ONE_GIB: usize = 1 << 30;
+    const LOW_RAM_MAX: usize = 3 << 30; // 3 GiB (0xC000_0000)
+
+    let parts: Vec<&str> = val.split(':').collect();
+    if parts.len() == 3 && parts[1] == "list" {
+        let path = PathBuf::from(parts[0]);
+        let mut extents: Vec<(u64, usize)> = Vec::new();
+        for item in parts[2].split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((pa_str, sz_str)) = item.split_once('@') {
+                if let (Some(pa), Some(sz)) = (parse_u64(pa_str), parse_u64(sz_str))
+                    && sz > 0
+                {
+                    extents.push((pa, sz as usize));
+                }
+            } else if let Some(pa) = parse_u64(item) {
+                extents.push((pa, ONE_GIB));
+            }
+        }
+        if extents.is_empty() {
+            return;
+        }
+        let devmem_file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[OVM-PREWARM] open {path:?} failed: {e}");
+                return;
+            }
+        };
+        let total_size: usize = extents.iter().map(|(_, sz)| *sz).sum();
+        let c_name = ffi::CString::new("ovm_dummy_premap").unwrap();
+        // SAFETY: `c_name` is a valid NUL-terminated C string.
+        let dummy_fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c_name.as_ptr(),
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if dummy_fd < 0 {
+            eprintln!("[OVM-PREWARM] memfd_create failed");
+            return;
+        }
+        // SAFETY: `dummy_fd` is a newly created valid file descriptor.
+        let dummy_file = unsafe { File::from_raw_fd(dummy_fd as RawFd) };
+        if let Err(e) = dummy_file.set_len(total_size as u64) {
+            eprintln!("[OVM-PREWARM] dummy set_len failed: {e}");
+            return;
+        }
+
+        let slices: Vec<(u64, usize)> = if total_size <= LOW_RAM_MAX {
+            vec![(0, total_size)]
+        } else {
+            vec![
+                (0, LOW_RAM_MAX),
+                (LOW_RAM_MAX as u64, total_size - LOW_RAM_MAX),
+            ]
+        };
+
+        let mut regions_out = Vec::new();
+        for (logical_off, reg_size) in slices {
+            let Ok(f_clone) = dummy_file.try_clone() else {
+                eprintln!("[OVM-PREWARM] try_clone failed");
+                return;
+            };
+            let fo = Some(FileOffset::new(f_clone, logical_off));
+            let mmap_flags = libc::MAP_SHARED | libc::MAP_NORESERVE;
+            let region = match MmapRegion::<AtomicBitmap>::build(
+                fo,
+                reg_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                mmap_flags,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "[OVM-PREWARM] MmapRegion::build(size=0x{reg_size:x}) failed: {e:?}"
+                    );
+                    return;
+                }
+            };
+            let base = region.as_ptr();
+            let slice_start = logical_off as usize;
+            let slice_end = slice_start + reg_size;
+            let mut cur_off: usize = 0;
+            for (idx, (ext_pa, ext_sz)) in extents.iter().copied().enumerate() {
+                let ext_start = cur_off;
+                let ext_end = cur_off + ext_sz;
+                cur_off = ext_end;
+                let ov_start = ext_start.max(slice_start);
+                let ov_end = ext_end.min(slice_end);
+                if ov_start >= ov_end {
+                    continue;
+                }
+                let map_len = ov_end - ov_start;
+                let in_slice_off = ov_start - slice_start;
+                let in_ext_off = (ov_start - ext_start) as u64;
+                let pa = ext_pa + in_ext_off;
+                // SAFETY: `in_slice_off + map_len <= reg_size`, so `base.add(in_slice_off)` is in bounds.
+                let target_va = unsafe { base.add(in_slice_off) };
+                // SAFETY: `target_va` and `map_len` lie within the reserved `region` mapping.
+                let mapped = unsafe {
+                    libc::mmap(
+                        target_va.cast(),
+                        map_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                        devmem_file.as_raw_fd(),
+                        pa as libc::off_t,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    let err = io::Error::last_os_error();
+                    eprintln!(
+                        "[OVM-PREWARM] mmap /dev/mem extent {idx} pa=0x{pa:x} len=0x{map_len:x} failed: {err}"
+                    );
+                    return;
+                }
+            }
+            prefault_and_dontdump(base, reg_size, path == Path::new("/dev/mem"));
+            let base_u64 = base as u64;
+            let num_extents = extents.len();
+            eprintln!(
+                "[OVM-PREWARM] Pre-mapped extent-list {path:?} at 0x{base_u64:x} (logical_off=0x{logical_off:x}, size=0x{reg_size:x}, extents={num_extents})"
+            );
+            regions_out.push((path.clone(), logical_off, reg_size, region));
+        }
+        prewarm_kvm_vm_and_vcpus(hypervisor, &regions_out);
+        *PREMAPPED_DEVMEM.lock().unwrap() = regions_out;
+        return;
+    }
+
+    let (path_str, off_str, size_str) = match parts.as_slice() {
+        [off_s, size_s] => ("/dev/mem", *off_s, *size_s),
+        [path_s, off_s, size_s] => (*path_s, *off_s, *size_s),
+        _ => return,
+    };
+    let (Some(base_offset), Some(size_u64)) = (parse_u64(off_str), parse_u64(size_str)) else {
+        return;
+    };
+    let total_size = size_u64 as usize;
+    if total_size == 0 {
+        return;
+    }
+    let path = PathBuf::from(path_str);
+    let is_devmem = path == Path::new("/dev/mem");
+    let sub_ranges: Vec<(u64, usize)> = if total_size <= LOW_RAM_MAX {
+        vec![(base_offset, total_size)]
+    } else {
+        vec![
+            (base_offset, LOW_RAM_MAX),
+            (base_offset + LOW_RAM_MAX as u64, total_size - LOW_RAM_MAX),
+        ]
+    };
+
+    let mut regions_out = Vec::new();
+    for (file_offset, size) in sub_ranges {
+        let Ok(f) = OpenOptions::new().read(true).write(true).open(&path) else {
+            return;
+        };
+        let fo = Some(FileOffset::new(f, file_offset));
+        let mmap_flags = libc::MAP_SHARED | libc::MAP_NORESERVE;
+        let Ok(region) = MmapRegion::<AtomicBitmap>::build(
+            fo,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            mmap_flags,
+        ) else {
+            return;
+        };
+        let base = region.as_ptr();
+        prefault_and_dontdump(base, size, is_devmem);
+        let base_u64 = base as u64;
+        eprintln!(
+            "[OVM-PREWARM] Pre-mapped {path:?} at 0x{base_u64:x} (offset=0x{file_offset:x}, size=0x{size:x})"
+        );
+        regions_out.push((path.clone(), file_offset, size, region));
+    }
+    prewarm_kvm_vm_and_vcpus(hypervisor, &regions_out);
+    *PREMAPPED_DEVMEM.lock().unwrap() = regions_out;
+}
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
@@ -2285,7 +2611,7 @@ impl MemoryManager {
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
             acpi_address,
-            log_dirty: dynamic, // Cannot log dirty pages on a TD
+            log_dirty: dynamic && env::var_os("OVM_PREMAP_DEVMEM").is_none(), // Cannot log dirty pages on a TD
             arch_mem_regions,
             ram_allocator,
             dynamic,
@@ -2476,6 +2802,23 @@ impl MemoryManager {
         existing_memory_file: Option<File>,
         thp: bool,
     ) -> Result<MmapRegion<AtomicBitmap>, Error> {
+        if existing_memory_file.is_none() && shared && backing_file.is_some() {
+            let mut guard = PREMAPPED_DEVMEM.lock().unwrap();
+            if let Some(idx) = guard.iter().position(|(p, off, sz, _)| {
+                backing_file.as_ref() == Some(p) && *off == file_offset && *sz == size
+            }) {
+                let (p, _, _, region) = guard.swap_remove(idx);
+                info!(
+                    "Reused pre-mapped & prefaulted {:?} region at 0x{:x} (offset=0x{:x}, size=0x{:x})",
+                    p,
+                    region.as_ptr() as u64,
+                    file_offset,
+                    size
+                );
+                return Ok(region);
+            }
+        }
+
         let mut mmap_flags = if reserve { 0 } else { libc::MAP_NORESERVE };
 
         // The duplication of mmap_flags ORing here is unfortunate but it also makes
@@ -2846,6 +3189,19 @@ impl MemoryManager {
     ) -> Result<u32, Error> {
         let slot = self.allocate_memory_slot();
 
+        if !readonly && !mergeable {
+            let mut guard = PREMAPPED_KVM_SLOTS.lock().unwrap();
+            if let Some(idx) = guard.iter().position(|(s, gpa, sz, uaddr)| {
+                *s == slot
+                    && *gpa == guest_phys_addr
+                    && *sz == memory_size
+                    && *uaddr == userspace_addr as usize
+            }) {
+                guard.swap_remove(idx);
+                return Ok(slot);
+            }
+        }
+
         info!(
             "Creating userspace mapping: {guest_phys_addr:x} -> {userspace_addr_:x} {memory_size:x}, slot {slot}",
             userspace_addr_ = userspace_addr as u64
@@ -3123,7 +3479,8 @@ impl MemoryManager {
                     MemoryRangePolicy::SkipPersisted => {
                         // Content already persisted through the backing file.
                         if let Some(file_offset) = shared_file_offset
-                            && Self::is_hardlink(file_offset.file())
+                            && (Self::is_hardlink(file_offset.file())
+                                || env::var_os("OVM_PREMAP_DEVMEM").is_some())
                         {
                             continue;
                         }

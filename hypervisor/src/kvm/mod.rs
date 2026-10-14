@@ -3959,6 +3959,10 @@ impl cpu::Vcpu for KvmVcpu {
     fn hypervisor_type(&self) -> HypervisorType {
         HypervisorType::Kvm
     }
+
+    fn set_vm_ops(&mut self, vm_ops: Arc<dyn vm::VmOps>) {
+        self.vm_ops = Some(vm_ops);
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

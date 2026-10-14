@@ -13,6 +13,7 @@
 #[cfg(feature = "tdx")]
 use std::io;
 use std::result;
+use std::sync::Arc;
 
 #[cfg(feature = "sev_snp")]
 use igvm::snp_defs::SevVmsa;
@@ -30,6 +31,7 @@ use crate::arch::aarch64::ExtendedReg;
 use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
+use crate::vm::VmOps;
 use crate::{CpuState, HypervisorType, MpState, StandardRegisters};
 
 #[cfg(target_arch = "x86_64")]
@@ -657,4 +659,9 @@ pub trait Vcpu: Send + Sync {
     /// The type of the hypervisor backing this vCPU
     ///
     fn hypervisor_type(&self) -> HypervisorType;
+
+    ///
+    /// Attach or update the VM exit handler (`VmOps`) on a pre-created vCPU
+    ///
+    fn set_vm_ops(&mut self, _vm_ops: Arc<dyn VmOps>) {}
 }

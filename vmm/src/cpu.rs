@@ -101,10 +101,11 @@ use crate::coredump::{
 use crate::gdb::{Debuggable, DebuggableError, get_raw_tid};
 #[cfg(all(feature = "sev_snp", feature = "mshv"))]
 use crate::igvm::HV_PAGE_SIZE;
+use crate::memory_manager::take_prewarmed_kvm_vcpu;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
-use crate::vm_config::{CoreScheduling, CpusConfig};
+use crate::vm_config::{CoreScheduling, CpusConfig, DEFAULT_MAX_PHYS_BITS};
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
@@ -132,6 +133,59 @@ pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
 // loaded hosts. These values are a sweet spot on developer laptops and servers.
 const VCPU_SERIALIZE_MAX_THREADS: usize = 32;
 const VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD: usize = 1;
+
+#[cfg(target_arch = "x86_64")]
+static CACHED_DEFAULT_CPUID: OnceLock<Vec<CpuIdEntry>> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static CACHED_DEFAULT_MSR_UPDATE: OnceLock<Option<VcpuMsrConfigUpdate>> = OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+pub fn get_cached_default_cpuid(
+    hypervisor: &dyn hypervisor::Hypervisor,
+) -> result::Result<Vec<CpuIdEntry>, arch::Error> {
+    if let Some(cpuid) = CACHED_DEFAULT_CPUID.get() {
+        return Ok(cpuid.clone());
+    }
+    let phys_bits = physical_bits(hypervisor, DEFAULT_MAX_PHYS_BITS);
+    let cpuid = arch::generate_common_cpuid(
+        hypervisor,
+        &arch::CpuidConfig {
+            phys_bits,
+            kvm_hyperv: false,
+            #[cfg(feature = "tdx")]
+            tdx: false,
+            amx: false,
+            profile: arch::CpuProfile::default(),
+        },
+    )?;
+    let _ = CACHED_DEFAULT_CPUID.set(cpuid.clone());
+    Ok(cpuid)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn get_cached_default_msr_updates(
+    hypervisor: &dyn hypervisor::Hypervisor,
+) -> Option<VcpuMsrConfigUpdate> {
+    if let Some(upd) = CACHED_DEFAULT_MSR_UPDATE.get() {
+        return upd.clone();
+    }
+    let upd = arch::x86_64::generate_required_msr_updates(
+        hypervisor,
+        arch::CpuProfile::default(),
+        false,
+        false,
+    )
+    .ok()
+    .flatten();
+    let _ = CACHED_DEFAULT_MSR_UPDATE.set(upd.clone());
+    upd
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn prewarm_cpuid_and_msrs(hypervisor: &dyn hypervisor::Hypervisor) {
+    let _ = get_cached_default_cpuid(hypervisor);
+    let _ = get_cached_default_msr_updates(hypervisor);
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -519,6 +573,17 @@ impl Vcpu {
         #[cfg(target_arch = "x86_64")] cpu_vendor: CpuVendor,
         #[cfg(target_arch = "x86_64")] msr_config_update: Option<VcpuMsrConfigUpdate>,
     ) -> Result<Self> {
+        if let Some(mut vcpu) = take_prewarmed_kvm_vcpu(apic_id) {
+            if let Some(ops) = vm_ops {
+                vcpu.set_vm_ops(ops);
+            }
+            return Ok(Vcpu {
+                vcpu,
+                id,
+                #[cfg(target_arch = "x86_64")]
+                vendor: cpu_vendor,
+            });
+        }
         let vcpu = vm
             .create_vcpu(
                 apic_id,
@@ -884,6 +949,7 @@ fn wait_short_no_sleep(spin_idx: u32) {
     }
 }
 
+
 /// Management structure for a vCPU (thread).
 #[derive(Default)]
 struct VcpuState {
@@ -1050,7 +1116,14 @@ impl CpuManager {
         let dynamic = true;
 
         #[cfg(target_arch = "x86_64")]
-        let cpuid = {
+        let cpuid = if dynamic
+            && !config.kvm_hyperv
+            && !config.features.amx
+            && config.profile == arch::CpuProfile::default()
+            && config.max_phys_bits == DEFAULT_MAX_PHYS_BITS
+        {
+            get_cached_default_cpuid(hypervisor.as_ref()).map_err(Error::CommonCpuId)?
+        } else {
             let phys_bits = physical_bits(hypervisor.as_ref(), config.max_phys_bits);
             arch::generate_common_cpuid(
                 hypervisor.as_ref(),
@@ -1067,13 +1140,21 @@ impl CpuManager {
         };
 
         #[cfg(target_arch = "x86_64")]
-        let msr_config_update = arch::x86_64::generate_required_msr_updates(
-            hypervisor.as_ref(),
-            config.profile,
-            config.kvm_hyperv,
-            config.nested,
-        )
-        .map_err(Error::MsrConfigurationUpdate)?;
+        let msr_config_update = if dynamic
+            && !config.kvm_hyperv
+            && !config.nested
+            && config.profile == arch::CpuProfile::default()
+        {
+            get_cached_default_msr_updates(hypervisor.as_ref())
+        } else {
+            arch::x86_64::generate_required_msr_updates(
+                hypervisor.as_ref(),
+                config.profile,
+                config.kvm_hyperv,
+                config.nested,
+            )
+            .map_err(Error::MsrConfigurationUpdate)?
+        };
 
         Ok(Arc::new(Mutex::new(CpuManager {
             config: config.clone(),
