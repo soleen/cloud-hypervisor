@@ -681,25 +681,33 @@ impl Vm {
 
         // Load files needed directly by the VMM.
         #[cfg(feature = "tdx")]
-        let kernel = config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .map(|p| p.kernel.as_ref().map(File::open))
-            .unwrap_or_default()
-            .transpose()
-            .map_err(Error::KernelFile)?;
+        let kernel = if snapshot.is_none() {
+            config
+                .lock()
+                .unwrap()
+                .payload
+                .as_ref()
+                .map(|p| p.kernel.as_ref().map(File::open))
+                .unwrap_or_default()
+                .transpose()
+                .map_err(Error::KernelFile)?
+        } else {
+            None
+        };
 
-        let initramfs = config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .filter(|payload| payload.firmware.is_none())
-            .and_then(|payload| payload.initramfs.as_ref().map(File::open))
-            .transpose()
-            .map_err(Error::InitramfsFile)?;
+        let initramfs = if snapshot.is_none() {
+            config
+                .lock()
+                .unwrap()
+                .payload
+                .as_ref()
+                .filter(|payload| payload.firmware.is_none())
+                .and_then(|payload| payload.initramfs.as_ref().map(File::open))
+                .transpose()
+                .map_err(Error::InitramfsFile)?
+        } else {
+            None
+        };
 
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
             let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
