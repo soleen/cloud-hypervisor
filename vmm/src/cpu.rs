@@ -20,9 +20,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::mem::zeroed;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
-use std::{any, cmp, hint, io, panic, result, thread, time};
+use std::{any, cmp, env, fs, hint, io, panic, result, thread, time};
 
 #[cfg(target_arch = "aarch64")]
 use acpi_tables::pptt::{CacheNodeBuilder, CacheType, PPTT, ProcessorNode};
@@ -830,6 +830,19 @@ impl TryFrom<i32> for CoreSchedulingLeader {
 }
 
 #[inline(always)]
+fn read_tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: _rdtsc is always safe to execute on x86_64 CPUs.
+        unsafe { _rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+#[inline(always)]
 fn wait_short_no_sleep(spin_idx: u32) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -887,6 +900,10 @@ struct VcpuState {
     paused: Arc<AtomicBool>,
     /// Waiter thread to unpark when vCPU acknowledges pause/signal.
     pause_waiter: Arc<Mutex<Option<thread::Thread>>>,
+    /// TSC recorded when vCPU first enters userspace from VM_RUN on pause.
+    last_exit_tsc: Arc<AtomicU64>,
+    /// TSC recorded immediately before vCPU returns into VM_RUN on resume.
+    last_enter_tsc: Arc<AtomicU64>,
 }
 
 impl VcpuState {
@@ -1318,6 +1335,10 @@ impl CpuManager {
         let vcpu_paused = Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].paused);
         let vcpu_pause_waiter =
             Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].pause_waiter);
+        let vcpu_last_exit_tsc =
+            Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].last_exit_tsc);
+        let vcpu_last_enter_tsc =
+            Arc::clone(&vcpu_states[usize::try_from(vcpu_id).unwrap()].last_enter_tsc);
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1449,7 +1470,8 @@ impl CpuManager {
                     vcpu_thread_barrier.wait();
 
                     panic::catch_unwind(move || {
-                        let mut has_entered_vm_run = false;
+                        let mut last_vm_exit_tsc: u64 = 0;
+                        let mut record_enter_tsc = true;
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1464,6 +1486,13 @@ impl CpuManager {
                             // to see them in a consistent order in all threads
 
                             if vcpus_pause_signalled.load(Ordering::SeqCst) {
+                                let exit_tsc = if last_vm_exit_tsc != 0 {
+                                    last_vm_exit_tsc
+                                } else {
+                                    read_tsc()
+                                };
+                                vcpu_last_exit_tsc.store(exit_tsc, Ordering::SeqCst);
+
                                 // As a pause can be caused by PIO & MMIO exits then we need to ensure they are
                                 // completed by returning to KVM_RUN. From the kernel docs:
                                 //
@@ -1480,7 +1509,7 @@ impl CpuManager {
                                 // to be executed.
 
                                 #[cfg(feature = "kvm")]
-                                if has_entered_vm_run
+                                if last_vm_exit_tsc != 0
                                     && matches!(hypervisor_type, HypervisorType::Kvm)
                                 {
                                     vcpu.lock().unwrap().vcpu.set_immediate_exit(true);
@@ -1501,6 +1530,7 @@ impl CpuManager {
                                 }
                                 vcpu_paused.store(false, Ordering::SeqCst);
                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
+                                record_enter_tsc = true;
                             }
 
                             if vcpus_kick_signalled.load(Ordering::SeqCst) {
@@ -1530,9 +1560,13 @@ impl CpuManager {
                             }
 
                             let mut vcpu = vcpu.lock().unwrap();
+                            if record_enter_tsc {
+                                vcpu_last_enter_tsc.store(read_tsc(), Ordering::SeqCst);
+                                record_enter_tsc = false;
+                            }
                             // vcpu.run() returns false on a triple-fault so trigger a reset
                             let run_res = vcpu.run();
-                            has_entered_vm_run = true;
+                            last_vm_exit_tsc = read_tsc();
                             match run_res {
                                 Ok(run) => match run {
                                     #[cfg(feature = "kvm")]
@@ -1735,6 +1769,28 @@ impl CpuManager {
             .map_err(|e| {
                 Error::StartRestoreVcpu(anyhow!("Failed to start restored vCPUs: {e:#?}"))
             })?;
+
+        if !paused {
+            let vcpu_states = self.vcpu_states.lock().unwrap();
+            let mut enter_report = String::new();
+            for (cpu_id, state) in vcpu_states.iter().enumerate() {
+                if state.active() {
+                    let mut waits = 0u32;
+                    while state.last_enter_tsc.load(Ordering::SeqCst) == 0
+                        && !state.vcpu_run_interrupted.load(Ordering::SeqCst)
+                        && waits < 10_000
+                    {
+                        wait_short_no_sleep(waits);
+                        waits += 1;
+                    }
+                    let enter_tsc = state.last_enter_tsc.load(Ordering::SeqCst);
+                    enter_report.push_str(&format!("{cpu_id} {enter_tsc}\n"));
+                }
+            }
+            let enter_path = env::var("OVM_BLACKOUT_ENTER_FILE")
+                .unwrap_or_else(|_| "/tmp/chv_blackout_enter.txt".to_string());
+            let _ = fs::write(&enter_path, &enter_report);
+        }
 
         Ok(())
     }
@@ -2868,6 +2924,12 @@ impl Aml for CpuManager {
 
 impl Pausable for CpuManager {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
+        for state in self.vcpu_states.lock().unwrap().iter() {
+            if state.active() {
+                state.last_exit_tsc.store(0, Ordering::SeqCst);
+            }
+        }
+
         // Tell the vCPUs to pause themselves next time they exit
         self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
 
@@ -2888,7 +2950,8 @@ impl Pausable for CpuManager {
 
         // The vCPU thread will change its paused state before parking, wait here for each
         // activated vCPU change their state to ensure they have parked.
-        for state in self.vcpu_states.lock().unwrap().iter() {
+        let mut exit_report = String::new();
+        for (cpu_id, state) in self.vcpu_states.lock().unwrap().iter().enumerate() {
             if state.active() {
                 // wait for vCPU to update state
                 let mut spins = 0u32;
@@ -2896,8 +2959,14 @@ impl Pausable for CpuManager {
                     wait_short_no_sleep(spins);
                     spins = spins.saturating_add(1);
                 }
+                let exit_tsc = state.last_exit_tsc.load(Ordering::SeqCst);
+                state.last_enter_tsc.store(0, Ordering::SeqCst);
+                exit_report.push_str(&format!("{cpu_id} {exit_tsc}\n"));
             }
         }
+        let exit_path = env::var("OVM_BLACKOUT_EXIT_FILE")
+            .unwrap_or_else(|_| "/tmp/chv_blackout_exit.txt".to_string());
+        let _ = fs::write(&exit_path, &exit_report);
 
         Ok(())
     }
@@ -2916,17 +2985,33 @@ impl Pausable for CpuManager {
                 state.unpark_thread();
             }
         }
-        // Step 2/2: wait for state ACK
+        // Step 2/2: wait for state ACK and KVM_RUN entry TSC
+        let mut enter_report = String::new();
         {
-            for state in vcpu_states.iter() {
+            for (cpu_id, state) in vcpu_states.iter().enumerate() {
                 // wait for vCPU to update state
                 let mut spins = 0u32;
                 while state.paused.load(Ordering::SeqCst) {
                     wait_short_no_sleep(spins);
                     spins = spins.saturating_add(1);
                 }
+                if state.active() {
+                    let mut waits = 0u32;
+                    while state.last_enter_tsc.load(Ordering::SeqCst) == 0
+                        && !state.vcpu_run_interrupted.load(Ordering::SeqCst)
+                        && waits < 10_000
+                    {
+                        wait_short_no_sleep(waits);
+                        waits += 1;
+                    }
+                    let enter_tsc = state.last_enter_tsc.load(Ordering::SeqCst);
+                    enter_report.push_str(&format!("{cpu_id} {enter_tsc}\n"));
+                }
             }
         }
+        let enter_path = env::var("OVM_BLACKOUT_ENTER_FILE")
+            .unwrap_or_else(|_| "/tmp/chv_blackout_enter.txt".to_string());
+        let _ = fs::write(&enter_path, &enter_report);
         Ok(())
     }
 }
