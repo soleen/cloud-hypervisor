@@ -3010,7 +3010,7 @@ impl Vm {
         Ok(())
     }
 
-    pub fn restore(&mut self) -> Result<()> {
+    pub fn restore(&mut self, resume: bool) -> Result<()> {
         event!("vm", "restoring");
 
         // We acquire all advisory disk image locks again.
@@ -3028,14 +3028,33 @@ impl Vm {
             .regenerate_vmgenid()
             .map_err(Error::DeviceManager)?;
 
+        if resume {
+            self.restore_guest_clock().map_err(Error::Resume)?;
+            if self.state == VmState::Paused {
+                self.vm.resume().map_err(Error::ResumeVm)?;
+            }
+            self.device_manager
+                .lock()
+                .unwrap()
+                .resume()
+                .map_err(Error::Resume)?;
+        }
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
             .unwrap()
-            .start_restored_vcpus()
+            .start_restored_vcpus(!resume)
             .map_err(Error::CpuManager)?;
 
         event!("vm", "restored");
+
+        if resume {
+            event!("vm", "resuming");
+            self.state = VmState::Running;
+            event!("vm", "resumed");
+        }
+
         Ok(())
     }
 

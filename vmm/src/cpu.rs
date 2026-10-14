@@ -1650,8 +1650,8 @@ impl CpuManager {
         Ok(())
     }
 
-    pub fn start_restored_vcpus(&mut self) -> Result<()> {
-        self.activate_vcpus(self.vcpus.len() as u32, false, Some(true))
+    pub fn start_restored_vcpus(&mut self, paused: bool) -> Result<()> {
+        self.activate_vcpus(self.vcpus.len() as u32, false, Some(paused))
             .map_err(|e| {
                 Error::StartRestoreVcpu(anyhow!("Failed to start restored vCPUs: {e:#?}"))
             })?;

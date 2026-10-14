@@ -1445,7 +1445,7 @@ impl Vmm {
             })?;
 
             // Create VM
-            vm.restore().map_err(|e| {
+            vm.restore(false).map_err(|e| {
                 // Inner error cannot be wrapped in anyhow::Error => print it
                 MigratableError::MigrateReceive(anyhow!(
                     "Failed restoring the VM: {}",
@@ -2061,6 +2061,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        resume: bool,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2129,7 +2130,7 @@ impl Vmm {
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
-                vm.restore()?;
+                vm.restore(resume)?;
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
             }
@@ -2702,14 +2703,8 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.resume,
                 )
-                .and_then(|()| {
-                    if restore_cfg.resume {
-                        self.vm_resume()
-                    } else {
-                        Ok(())
-                    }
-                })
                 .map_err(|e| {
                     error!("VM Restore failed: {e:?}");
                     if let Err(e) = self.vm_delete() {
